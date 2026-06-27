@@ -23,6 +23,21 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 1b. Select the newest installed Xcode and report the iOS SDK. The app is
+      #     built against the iOS 26 SDK, so the runner needs a matching Xcode.
+      #     If the SDK printed here is older than the app's target, switch
+      #     `runs-on` above to a macOS image that ships Xcode 26 (e.g. macos-26).
+      - name: Select latest Xcode and show iOS SDK
+        run: |
+          set -euo pipefail
+          echo "Installed Xcodes:"; ls -d /Applications/Xcode*.app 2>/dev/null || true
+          LATEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$LATEST" ]; then sudo xcode-select -s "$LATEST/Contents/Developer"; fi
+          echo "Selected Xcode:"; xcodebuild -version
+          echo "Available iOS SDKs:"; xcodebuild -showsdks | grep -i iphoneos || true
+          echo "iphoneos SDK version: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iphoneos SDK build:   $(xcrun --sdk iphoneos --show-sdk-build-version)"
+
       # 2. Import the Distribution certificate (.p12) into a temporary keychain
       #    so codesign can find the signing identity.
       - name: Import signing certificate
@@ -69,15 +84,47 @@ jobs:
           APP="$(ls -d "$WORK"/Payload/*.app)"
           echo "App bundle: $APP"
 
-          # 3a. Embed the provisioning profile (App Store builds require this).
+          # 3a. Inject the build-provenance keys Apple requires. A Linux/WSL build
+          #     omits these (they're normally written by Xcode), which triggers
+          #     "Missing Info.plist value 'DTPlatformName'" and "Unsupported SDK".
+          #     Values are read from the real SDK installed on this runner, so they
+          #     always reference a supported Xcode. Must run BEFORE codesign.
+          INFO="$APP/Info.plist"
+          PB=/usr/libexec/PlistBuddy
+          SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version)"
+          PLAT_VER_PLIST="$(xcode-select -p)/Platforms/iPhoneOS.platform/version.plist"
+          PLATFORM_BUILD="$($PB -c 'Print :ProductBuildVersion' "$PLAT_VER_PLIST" 2>/dev/null || echo "$SDK_BUILD")"
+          XVER="$(xcodebuild -version | awk 'NR==1{print $2}')"
+          XBUILD="$(xcodebuild -version | awk 'NR==2{print $3}')"
+          DTXCODE="$(echo "$XVER" | awk -F. '{printf "%02d%d%d", $1, $2, ($3==""?0:$3)}')"
+          OSBUILD="$(sw_vers --buildVersion)"
+
+          set_key() { $PB -c "Add :$1 string $2" "$INFO" 2>/dev/null || $PB -c "Set :$1 $2" "$INFO"; }
+          set_key DTPlatformName      "iphoneos"
+          set_key DTPlatformVersion   "$SDK_VER"
+          set_key DTPlatformBuild     "$PLATFORM_BUILD"
+          set_key DTSDKName           "iphoneos$SDK_VER"
+          set_key DTSDKBuild          "$SDK_BUILD"
+          set_key DTXcode             "$DTXCODE"
+          set_key DTXcodeBuild        "$XBUILD"
+          set_key DTCompiler          "com.apple.compilers.llvm.clang.1_0"
+          set_key BuildMachineOSBuild "$OSBUILD"
+          echo "--- injected Info.plist build keys ---"
+          for k in DTPlatformName DTPlatformVersion DTPlatformBuild DTSDKName DTSDKBuild \
+                   DTXcode DTXcodeBuild DTCompiler BuildMachineOSBuild; do
+            printf '  %s = %s\n' "$k" "$($PB -c "Print :$k" "$INFO")"
+          done
+
+          # 3b. Embed the provisioning profile (App Store builds require this).
           cp "$PROFILE" "$APP/embedded.mobileprovision"
 
-          # 3b. Extract the entitlements that the profile authorizes.
+          # 3c. Extract the entitlements that the profile authorizes.
           security cms -D -i "$PROFILE" > "$WORK/profile.plist"
           /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$WORK/profile.plist" > "$WORK/entitlements.plist"
           echo "--- entitlements ---"; cat "$WORK/entitlements.plist"
 
-          # 3c. Drop the stale ad-hoc signature, then sign any nested code, then the app.
+          # 3d. Drop the stale ad-hoc signature, then sign any nested code, then the app.
           rm -rf "$APP/_CodeSignature"
           find "$APP" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) -print0 \
             | while IFS= read -r -d '' nested; do
@@ -87,10 +134,10 @@ jobs:
             --entitlements "$WORK/entitlements.plist" \
             --sign "$SIGNING_IDENTITY" "$APP"
 
-          # 3d. Verify the signature is valid before we waste an upload round-trip.
+          # 3e. Verify the signature is valid before we waste an upload round-trip.
           codesign --verify --deep --strict --verbose=2 "$APP"
 
-          # 3e. Repackage (-y preserves any symlinks inside frameworks).
+          # 3f. Repackage (-y preserves any symlinks inside frameworks).
           ( cd "$WORK" && zip -qry "$GITHUB_WORKSPACE/${SIGNED_IPA#./}" Payload )
           echo "Re-signed IPA written to $SIGNED_IPA"
 
