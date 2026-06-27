@@ -26,7 +26,7 @@ jobs:
       - name: Validate and Upload to App Store Connect
         run: |
           # Define the target path where your .ipa file is stored in the repository
-          IPA_PATH="./mobile.ipa"
+          IPA_PATH="./mobile-dist.ipa"
           
           echo "Validating App Asset..."
           xcrun altool --validate-app \
