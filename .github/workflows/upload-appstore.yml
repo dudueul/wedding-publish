@@ -72,10 +72,12 @@ jobs:
       - name: Re-sign IPA with Distribution identity
         env:
           PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-          # Monotonic build number injected from CI. run_number increases on every
-          # run; the run_attempt suffix keeps manual "Re-run" of the same run unique
-          # too. Both compare numerically, component-wise, so it always increases.
-          BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+          # Pieces of the build number. run_number (most significant) increases on
+          # every run; run_attempt covers manual "Re-run" of the same run. The date
+          # is filled in on the runner. CFBundleVersion compares numerically,
+          # component-wise, and run_number leads, so it's always strictly increasing.
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/resign"
@@ -125,7 +127,9 @@ jobs:
 
           # Build number (CFBundleVersion): must be unique and higher than every
           # previously uploaded build. Injected from CI so you never bump it by hand.
+          # Format: <run_number>.<YYYYMMDD>.<run_attempt>  e.g. 9.20260628.1
           # CFBundleShortVersionString (the 1.0.0 marketing version) is left as-is.
+          BUILD_NUMBER="${RUN_NUMBER}.$(date +%Y%m%d).${RUN_ATTEMPT}"
           set_key CFBundleVersion "$BUILD_NUMBER"
           echo "CFBundleVersion (build)   = $($PB -c 'Print :CFBundleVersion' "$INFO")"
           echo "CFBundleShortVersionString = $($PB -c 'Print :CFBundleShortVersionString' "$INFO")"
