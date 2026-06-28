@@ -100,7 +100,8 @@ jobs:
           DTXCODE="$(echo "$XVER" | awk -F. '{printf "%02d%d%d", $1, $2, ($3==""?0:$3)}')"
           OSBUILD="$(sw_vers --buildVersion)"
 
-          set_key() { $PB -c "Add :$1 string $2" "$INFO" 2>/dev/null || $PB -c "Set :$1 $2" "$INFO"; }
+          set_key()  { $PB -c "Add :$1 string $2" "$INFO" 2>/dev/null || $PB -c "Set :$1 $2" "$INFO"; }
+          set_bool() { $PB -c "Add :$1 bool $2"   "$INFO" 2>/dev/null || $PB -c "Set :$1 $2" "$INFO"; }
           set_key DTPlatformName      "iphoneos"
           set_key DTPlatformVersion   "$SDK_VER"
           set_key DTPlatformBuild     "$PLATFORM_BUILD"
@@ -110,21 +111,64 @@ jobs:
           set_key DTXcodeBuild        "$XBUILD"
           set_key DTCompiler          "com.apple.compilers.llvm.clang.1_0"
           set_key BuildMachineOSBuild "$OSBUILD"
+
+          # Export-compliance: declare the app uses no non-exempt encryption (only
+          # standard, exempt stuff like HTTPS/TLS). This pre-answers the encryption
+          # question so the build isn't held in App Store Connect after processing.
+          # If the app implements its OWN/proprietary crypto, set this to true and
+          # complete the compliance documentation instead.
+          set_bool ITSAppUsesNonExemptEncryption false
+
           echo "--- injected Info.plist build keys ---"
           for k in DTPlatformName DTPlatformVersion DTPlatformBuild DTSDKName DTSDKBuild \
-                   DTXcode DTXcodeBuild DTCompiler BuildMachineOSBuild; do
+                   DTXcode DTXcodeBuild DTCompiler BuildMachineOSBuild ITSAppUsesNonExemptEncryption; do
             printf '  %s = %s\n' "$k" "$($PB -c "Print :$k" "$INFO")"
           done
 
-          # 3b. Embed the provisioning profile (App Store builds require this).
+          # 3b. Compile a real app-icon asset catalog with actool. A Linux build
+          #     ships no Assets.car, so Apple rejects the bundle for missing
+          #     120x120 / 152x152 icons and a missing CFBundleIconName. We build a
+          #     single-size (1024, opaque) AppIcon set and let actool render every
+          #     required size and emit the matching Info.plist keys. Before codesign.
+          ICON_SRC="$GITHUB_WORKSPACE/appicon-1024.png"
+          ASSETS="$WORK/AppIcon.xcassets"
+          ICONSET="$ASSETS/AppIcon.appiconset"
+          mkdir -p "$ICONSET"
+          cp "$ICON_SRC" "$ICONSET/icon-1024.png"
+          printf '%s\n' '{ "images":[{"filename":"icon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}], "info":{"author":"xcode","version":1} }' > "$ICONSET/Contents.json"
+          printf '%s\n' '{ "info":{"author":"xcode","version":1} }' > "$ASSETS/Contents.json"
+
+          # min-deployment-target 15.0 only governs which icon variants actool
+          # synthesizes (it guarantees the classic 120/152 set Apple validates);
+          # the app's real deployment target stays MinimumOSVersion in Info.plist.
+          xcrun actool \
+            --compile "$APP" \
+            --app-icon AppIcon \
+            --platform iphoneos \
+            --minimum-deployment-target 15.0 \
+            --target-device iphone --target-device ipad \
+            --output-partial-info-plist "$WORK/icon-partial.plist" \
+            --errors --warnings --notices \
+            "$ASSETS"
+
+          echo "--- actool partial Info.plist ---"; cat "$WORK/icon-partial.plist"
+          # Merge actool's icon keys (CFBundleIcons, CFBundleIconName) into Info.plist,
+          # drop the legacy single-file key, and overwrite the stray alpha icon.
+          $PB -c "Merge $WORK/icon-partial.plist" "$INFO"
+          $PB -c "Delete :CFBundleIconFile" "$INFO" 2>/dev/null || true
+          cp "$ICON_SRC" "$APP/icon-1024.png"
+          echo "CFBundleIconName = $($PB -c 'Print :CFBundleIconName' "$INFO" 2>/dev/null || echo MISSING)"
+          echo "Assets.car present: $([ -f "$APP/Assets.car" ] && echo yes || echo NO)"
+
+          # 3c. Embed the provisioning profile (App Store builds require this).
           cp "$PROFILE" "$APP/embedded.mobileprovision"
 
-          # 3c. Extract the entitlements that the profile authorizes.
+          # 3d. Extract the entitlements that the profile authorizes.
           security cms -D -i "$PROFILE" > "$WORK/profile.plist"
           /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$WORK/profile.plist" > "$WORK/entitlements.plist"
           echo "--- entitlements ---"; cat "$WORK/entitlements.plist"
 
-          # 3d. Drop the stale ad-hoc signature, then sign any nested code, then the app.
+          # 3e. Drop the stale ad-hoc signature, then sign any nested code, then the app.
           rm -rf "$APP/_CodeSignature"
           find "$APP" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) -print0 \
             | while IFS= read -r -d '' nested; do
@@ -134,10 +178,10 @@ jobs:
             --entitlements "$WORK/entitlements.plist" \
             --sign "$SIGNING_IDENTITY" "$APP"
 
-          # 3e. Verify the signature is valid before we waste an upload round-trip.
+          # 3f. Verify the signature is valid before we waste an upload round-trip.
           codesign --verify --deep --strict --verbose=2 "$APP"
 
-          # 3f. Repackage (-y preserves any symlinks inside frameworks).
+          # 3g. Repackage (-y preserves any symlinks inside frameworks).
           ( cd "$WORK" && zip -qry "$GITHUB_WORKSPACE/${SIGNED_IPA#./}" Payload )
           echo "Re-signed IPA written to $SIGNED_IPA"
 
