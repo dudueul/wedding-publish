@@ -1,3 +1,29 @@
+# Reference copy of the prod-dist repo's upload workflow
+# (.github/workflows/upload-to-appstore.yml in that repo — keep the two in
+# sync; this copy lives here so the wedding repo tracks the full upload
+# pipeline next to DEPLOYMENT.md and the App Review docs).
+#
+# Round-2 App Review hardening (see docs/APP_REVIEW_2026-07-ROUND2.md):
+#   - The provisioning profile is now read from a COMMITTED file at the
+#     prod-dist repo root (./embedded.mobileprovision), not from the
+#     IOS_PROVISIONING_PROFILE_BASE64 secret. A profile contains no private
+#     key — it ships inside every distributed IPA — so it is not secret
+#     material, and an opaque secret is exactly how a stale profile (the old
+#     Apple Pay/Wallet-entitled SMWedding_AppStore_Profile) can silently keep
+#     shipping: nobody can diff a secret. Commit the CLEAN profile
+#     (SMWedding_AppStore_Profile_2) and rotation becomes a reviewable diff.
+#     The .p12 identity, its password, and the ASC API key stay secrets —
+#     those ARE private key material.
+#   - "Guard: provisioning profile" hard-fails on Apple Pay/Wallet
+#     entitlements BEFORE any signing (guideline 2.1 PassKit rejection).
+#   - Post-sign checks fail on PassKit linkage / payment entitlements in the
+#     SIGNED app, and assert the 2.3.8 display name.
+#   - CFBundleVersion leads with BUILD_NUMBER_BASE + run_number so CI builds
+#     always outrank the manually-uploaded 11.*/12.*/13.* stamps (ASC dedup +
+#     the in-app update prompt both compare component-wise numerically).
+#   - Soft pre-flight warns when the App Review demo access code is not live
+#     (guideline 2.1(a): the login screen's access box is server-gated).
+
 name: Upload iOS App to App Store Connect
 
 on:
@@ -17,13 +43,63 @@ jobs:
       SIGNING_IDENTITY: "Apple Distribution: SEONGWOO HONG (SPQDMJ2T53)"
       UNSIGNED_IPA: "./mobile.ipa"
       SIGNED_IPA: "./mobile-dist.ipa"
+      # App Store provisioning profile, committed at the repo root (see header
+      # note — deliberately NOT a secret so it can be inspected and diffed).
+      PROFILE: "./embedded.mobileprovision"
+      # Leading CFBundleVersion component = BUILD_NUMBER_BASE + run_number.
+      # Manual (non-CI) uploads used 11.*, 12.*, and 13.* — the base keeps every
+      # CI build strictly above them even though this workflow's run_number
+      # starts at 1. Never lower this; raise it if a manual upload ever goes
+      # past it.
+      BUILD_NUMBER_BASE: "20"
 
     steps:
       # 1. Check out your code repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1b. Select the newest installed Xcode and report the iOS SDK. The app is
+      # 1a. GUARD (guideline 2.1 — PassKit): refuse to sign with a profile
+      #     carrying Apple Pay / Wallet entitlements. codesign inherits the
+      #     profile's entitlements into the app signature, and Apple's static
+      #     analysis reads those entitlements as "the binary includes PassKit"
+      #     — that is how One Seoul 1.0.0 was rejected TWICE while the Mach-O
+      #     never linked PassKit. Runs before anything else so a wrong profile
+      #     fails in seconds, and prints the profile identity so the run log
+      #     shows exactly what was shipped.
+      - name: Guard - provisioning profile is the clean App Store profile
+        run: |
+          set -euo pipefail
+          test -f "$PROFILE" || { echo "::error::$PROFILE not found — commit the App Store profile at the repo root."; exit 1; }
+          security cms -D -i "$PROFILE" > "$RUNNER_TEMP/profile-guard.plist"
+          PB=/usr/libexec/PlistBuddy
+          echo "Profile name:    $($PB -c 'Print :Name' "$RUNNER_TEMP/profile-guard.plist")"
+          echo "Profile UUID:    $($PB -c 'Print :UUID' "$RUNNER_TEMP/profile-guard.plist")"
+          echo "Profile expires: $($PB -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile-guard.plist")"
+          echo "App ID:          $($PB -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile-guard.plist")"
+          for banned in com.apple.developer.in-app-payments com.apple.developer.pass-type-identifiers; do
+            if grep -q "$banned" "$RUNNER_TEMP/profile-guard.plist"; then
+              echo "::error title=Apple Pay entitlement in profile::$PROFILE carries '$banned'. This reproduces the guideline 2.1 PassKit rejection. Disable Apple Pay + Wallet on the App ID, regenerate the App Store profile, and commit the clean one."
+              exit 1
+            fi
+          done
+          echo "OK: no Apple Pay / Wallet entitlements."
+
+      # 1b. Soft pre-flight (guideline 2.1(a) — demo access): the App Review
+      #     access-code box on the login screen only renders while the backend
+      #     REVIEW_CODE secret is set. An upload with the demo offline is fine
+      #     (you may set the code later), but SUBMITTING for review without it
+      #     re-triggers the "unable to access the app" rejection — so warn
+      #     loudly, don't fail.
+      - name: Pre-flight - App Review demo access live? (warning only)
+        run: |
+          BODY="$(curl -fsS --max-time 10 https://wedding.at.day/api/auth/review || echo unreachable)"
+          echo "GET /api/auth/review -> $BODY"
+          case "$BODY" in
+            *'"available":true'*) echo "Demo access is live." ;;
+            *) echo "::warning title=App Review demo access is NOT live::Set the REVIEW_CODE secret (wrangler secret put REVIEW_CODE) and fill the ASC demo username/password BEFORE submitting this build for review — see APP_REVIEW_2026-07-ROUND2.md." ;;
+          esac
+
+      # 1c. Select the newest installed Xcode and report the iOS SDK. The app is
       #     built against the iOS 26 SDK, so the runner needs a matching Xcode.
       #     If the SDK printed here is older than the app's target, switch
       #     `runs-on` above to a macOS image that ships Xcode 26 (e.g. macos-26).
@@ -71,19 +147,20 @@ jobs:
       # 3. Embed the App Store provisioning profile and re-sign the .app, then repackage.
       - name: Re-sign IPA with Distribution identity
         env:
-          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-          # Pieces of the build number. run_number (most significant) increases on
-          # every run; run_attempt covers manual "Re-run" of the same run. The date
-          # is filled in on the runner. CFBundleVersion compares numerically,
-          # component-wise, and run_number leads, so it's always strictly increasing.
+          # Pieces of the build number. run_number (most significant, plus the
+          # BUILD_NUMBER_BASE offset) increases on every run; run_attempt covers
+          # manual "Re-run" of the same run. The date is filled in on the runner.
+          # CFBundleVersion compares numerically, component-wise, and the offset
+          # run_number leads, so it's always strictly increasing AND above every
+          # manually-stamped upload (11.*/12.*/13.*). The in-app update prompt
+          # (AppUpdateStore.isNewer) relies on that same component-wise
+          # comparison, so a CI build numbered below a shipped build would make
+          # the update prompt lie.
           RUN_NUMBER: ${{ github.run_number }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/resign"
-          PROFILE="$RUNNER_TEMP/profile.mobileprovision"
-
-          echo -n "$PROFILE_BASE64" | base64 --decode -o "$PROFILE"
 
           rm -rf "$WORK"; mkdir -p "$WORK"
           unzip -q "$UNSIGNED_IPA" -d "$WORK"
@@ -125,11 +202,20 @@ jobs:
           # complete the compliance documentation instead.
           set_bool ITSAppUsesNonExemptEncryption false
 
+          # Guard (guideline 2.3.8): the on-device name must match the
+          # marketplace name "One Seoul" — a stale mobile.ipa copied from before
+          # the round-1 rename would silently reintroduce that rejection.
+          DISPLAY_NAME="$($PB -c 'Print :CFBundleDisplayName' "$INFO" 2>/dev/null || echo MISSING)"
+          if [ "$DISPLAY_NAME" != "One Seoul" ]; then
+            echo "::error title=Display name mismatch::CFBundleDisplayName is '$DISPLAY_NAME', expected 'One Seoul' (guideline 2.3.8). The committed mobile.ipa is stale — rebuild it from the wedding repo."
+            exit 1
+          fi
+
           # Build number (CFBundleVersion): must be unique and higher than every
           # previously uploaded build. Injected from CI so you never bump it by hand.
-          # Format: <run_number>.<YYYYMMDD>.<run_attempt>  e.g. 9.20260628.1
+          # Format: <base+run_number>.<YYYYMMDD>.<run_attempt>  e.g. 21.20260703.1
           # CFBundleShortVersionString (the 1.0.0 marketing version) is left as-is.
-          BUILD_NUMBER="${RUN_NUMBER}.$(date +%Y%m%d).${RUN_ATTEMPT}"
+          BUILD_NUMBER="$((BUILD_NUMBER_BASE + RUN_NUMBER)).$(date +%Y%m%d).${RUN_ATTEMPT}"
           set_key CFBundleVersion "$BUILD_NUMBER"
           echo "CFBundleVersion (build)   = $($PB -c 'Print :CFBundleVersion' "$INFO")"
           echo "CFBundleShortVersionString = $($PB -c 'Print :CFBundleShortVersionString' "$INFO")"
@@ -176,6 +262,7 @@ jobs:
           echo "Assets.car present: $([ -f "$APP/Assets.car" ] && echo yes || echo NO)"
 
           # 3c. Embed the provisioning profile (App Store builds require this).
+          #     $PROFILE is the committed, guard-checked file from step 1a.
           cp "$PROFILE" "$APP/embedded.mobileprovision"
 
           # 3d. Extract the entitlements that the profile authorizes.
@@ -196,7 +283,24 @@ jobs:
           # 3f. Verify the signature is valid before we waste an upload round-trip.
           codesign --verify --deep --strict --verbose=2 "$APP"
 
-          # 3g. Repackage (-y preserves any symlinks inside frameworks).
+          # 3g. GUARD (guideline 2.1 — PassKit), on the SIGNED artifact this
+          #     time: the app must neither link PassKit nor carry payment
+          #     entitlements in its final signature. otool -L lists every
+          #     LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB, which is exactly what
+          #     Apple's static analysis reads.
+          EXECUTABLE="$APP/$($PB -c 'Print :CFBundleExecutable' "$INFO")"
+          if otool -L "$EXECUTABLE" | grep -qi 'PassKit'; then
+            echo "::error title=PassKit linked::$EXECUTABLE links PassKit.framework — guideline 2.1 rejection guaranteed. The committed mobile.ipa is wrong; rebuild from the wedding repo."
+            exit 1
+          fi
+          codesign -d --entitlements - --xml "$APP" > "$WORK/signed-entitlements.plist" 2>/dev/null
+          if grep -Eq 'in-app-payments|pass-type-identifiers' "$WORK/signed-entitlements.plist"; then
+            echo "::error title=Payment entitlements in signature::The signed app carries Apple Pay/Wallet entitlements (from the profile) — guideline 2.1 rejection guaranteed."
+            exit 1
+          fi
+          echo "OK: signed app has no PassKit linkage and no payment entitlements."
+
+          # 3h. Repackage (-y preserves any symlinks inside frameworks).
           ( cd "$WORK" && zip -qry "$GITHUB_WORKSPACE/${SIGNED_IPA#./}" Payload )
           echo "Re-signed IPA written to $SIGNED_IPA"
 
